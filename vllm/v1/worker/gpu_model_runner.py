@@ -158,6 +158,7 @@ from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ECConnectorOutput,
+    GpuIterationTiming,
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -246,6 +247,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        timing_forward_start: torch.cuda.Event | None = None,
+        timing_forward_end: torch.cuda.Event | None = None,
+        timing_sample_end: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -259,6 +263,14 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
+
+        # GPU timing events recorded on the main compute stream around the
+        # forward pass and sampler. Resolved in get_output() after
+        # async_copy_ready_event has fired -- by then the copy stream has
+        # joined the main stream past these events, so they have completed.
+        self._timing_forward_start = timing_forward_start
+        self._timing_forward_end = timing_forward_end
+        self._timing_sample_end = timing_sample_end
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -312,6 +324,23 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._routed_experts_cpu is not None:
             output.routed_experts = self._routed_experts_cpu.tolists()
         del self._routed_experts
+
+        # Resolve GPU timing. async_copy_ready_event has fired, which means
+        # the copy stream has joined the main stream past all three events,
+        # so elapsed_time() is non-blocking.
+        if (
+            self._timing_forward_start is not None
+            and self._timing_forward_end is not None
+            and self._timing_sample_end is not None
+        ):
+            output.gpu_timing = GpuIterationTiming(
+                forward_ms=self._timing_forward_start.elapsed_time(
+                    self._timing_forward_end
+                ),
+                sample_ms=self._timing_forward_end.elapsed_time(
+                    self._timing_sample_end
+                ),
+            )
 
         return output
 
@@ -413,6 +442,11 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    # GPU timing events recorded on the compute stream around the forward
+    # pass. None when enable_logging_iteration_details is off. The matching
+    # sample_end event is created and recorded in sample_tokens().
+    timing_forward_start: torch.cuda.Event | None
+    timing_forward_end: torch.cuda.Event | None
 
 
 class GPUModelRunner(
@@ -695,6 +729,20 @@ class GPUModelRunner(
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+
+        # Per-iteration GPU latency measurement. When enabled, the forward
+        # pass and sampler are bracketed with torch.cuda.Event(enable_timing
+        # =True) records on the compute stream. The events flow from
+        # execute_model() to sample_tokens() via ExecuteModelState, then
+        # the elapsed time is resolved at a point where the GPU has
+        # provably reached past them: for the sync path, at the end of
+        # sample_tokens() (the bookkeeping sync has already drained the
+        # stream); for the async path, inside AsyncGPUModelRunnerOutput's
+        # get_output() after the copy event syncs (the copy stream waited
+        # on the main stream after compute). No new GPU syncs are added.
+        self._gpu_timing_enabled: bool = bool(
+            self.observability_config.enable_logging_iteration_details
+        )
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -4260,6 +4308,11 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        # Record GPU timing event at the start of the forward pass.
+        timing_forward_start: torch.cuda.Event | None = None
+        if self._gpu_timing_enabled:
+            timing_forward_start = torch.cuda.Event(enable_timing=True)
+            timing_forward_start.record()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4344,6 +4397,12 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # Record GPU timing event at the end of the forward pass (logits ready).
+        timing_forward_end: torch.cuda.Event | None = None
+        if timing_forward_start is not None:
+            timing_forward_end = torch.cuda.Event(enable_timing=True)
+            timing_forward_end.record()
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4355,6 +4414,8 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            timing_forward_start,
+            timing_forward_end,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4406,6 +4467,8 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            timing_forward_start,
+            timing_forward_end,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4418,6 +4481,14 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # Record GPU timing event at the end of sampling. Resolution happens
+        # either inline below (sync path) or inside
+        # AsyncGPUModelRunnerOutput.get_output() (async path).
+        timing_sample_end: torch.cuda.Event | None = None
+        if timing_forward_start is not None and timing_forward_end is not None:
+            timing_sample_end = torch.cuda.Event(enable_timing=True)
+            timing_sample_end.record()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4593,6 +4664,18 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            # Sync path: _bookkeeping_sync above has drained the compute
+            # stream via its D2H copies, so the timing events have fired
+            # and elapsed_time() is non-blocking.
+            if (
+                timing_forward_start is not None
+                and timing_forward_end is not None
+                and timing_sample_end is not None
+            ):
+                output.gpu_timing = GpuIterationTiming(
+                    forward_ms=timing_forward_start.elapsed_time(timing_forward_end),
+                    sample_ms=timing_forward_end.elapsed_time(timing_sample_end),
+                )
             return output
 
         with record_function_or_nullcontext(
@@ -4629,6 +4712,9 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
+                timing_forward_start=timing_forward_start,
+                timing_forward_end=timing_forward_end,
+                timing_sample_end=timing_sample_end,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

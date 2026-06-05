@@ -191,7 +191,15 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    float,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -400,13 +408,17 @@ class EngineCore:
             raise err
 
     @contextmanager
-    def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
+    def log_iteration_details(
+        self,
+        scheduler_output: SchedulerOutput | None,
+        submit_time: float | None = None,
+    ):
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
-            yield
+            yield lambda _: None
             return
         # 0-token step: let the dummy_batch wrapper log it (avoids double-log).
         if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
-            yield
+            yield lambda _: None
             return
         self._iteration_index = getattr(self, "_iteration_index", 0)
         # scheduler_output=None marks a DP dummy iteration.
@@ -417,7 +429,29 @@ class EngineCore:
             iteration_details = compute_iteration_details(scheduler_output)
             is_dummy = False
         before = time.monotonic()
-        yield
+        captured: dict[str, Any] = {}
+
+        def capture_output(model_output):
+            captured["model_output"] = model_output
+
+        yield capture_output
+        if submit_time is not None:
+            elapsed_ms = (time.monotonic() - submit_time) * 1000
+        else:
+            elapsed_ms = (time.monotonic() - before) * 1000
+
+        # If the worker measured per-iteration GPU timing, it is attached to
+        # the ModelRunnerOutput as part of get_output() / sample_tokens(),
+        # so it reflects this iteration's GPU forward + sampler latency.
+        gpu_timing_str = ""
+        model_output = captured.get("model_output")
+        gpu_timing = getattr(model_output, "gpu_timing", None)
+        if gpu_timing is not None:
+            gpu_timing_str = (
+                f", gpu_forward: {gpu_timing.forward_ms:.4f} ms, "
+                f"gpu_sample: {gpu_timing.sample_ms:.4f} ms"
+            )
+
         logger.info(
             "".join(
                 [
@@ -432,9 +466,10 @@ class EngineCore:
                     " generation requests, ",
                     str(iteration_details.num_generation_tokens),
                     " generation tokens, iteration elapsed time: ",
-                    format((time.monotonic() - before) * 1000, ".2f"),
+                    format(elapsed_ms, ".4f"),
                     " ms",
                     " (dummy)" if is_dummy else "",
+                    gpu_timing_str,
                 ]
             )
         )
@@ -456,11 +491,12 @@ class EngineCore:
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(scheduler_output) as capture_iter_output,
         ):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            capture_iter_output(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -537,7 +573,9 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (future, scheduler_output, exec_future, time.monotonic())
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -552,10 +590,12 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, submit_time = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(
+                scheduler_output, submit_time=submit_time
+            ) as capture_iter_output,
         ):
             model_output = future.result()
             if model_output is None:
@@ -563,6 +603,7 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+            capture_iter_output(model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -593,7 +634,7 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            batch_queue.appendleft((future, deferred_scheduler_output, exec_future, time.monotonic()))
 
         return engine_core_outputs, model_executed
 

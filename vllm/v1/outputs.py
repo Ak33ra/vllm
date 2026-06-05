@@ -228,6 +228,18 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class GpuIterationTiming:
+    # Forward pass time (input ids -> logits ready) measured on the GPU
+    # compute stream via torch.cuda.Event(enable_timing=True). Resolved at
+    # a point where the events have already fired (the bookkeeping sync in
+    # the sync path; the async-copy-event sync inside AsyncGPUModelRunnerOutput
+    # in the async path), so elapsed_time() never blocks.
+    forward_ms: float
+    # Sampling time (sampler kernels on the compute stream).
+    sample_ms: float
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -268,6 +280,11 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # GPU-measured timing for this iteration. Populated when
+    # observability_config.enable_logging_iteration_details is on. None
+    # on early-return paths (empty batches, encoder-only) and non-CUDA runners.
+    gpu_timing: GpuIterationTiming | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
