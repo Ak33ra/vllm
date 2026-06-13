@@ -240,6 +240,10 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Number of unscheduled requests remaining in the waiting queues after this
+    # scheduling step selected the current batch.
+    num_waiting_reqs_after_schedule: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

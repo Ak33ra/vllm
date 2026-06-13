@@ -424,9 +424,13 @@ class EngineCore:
         # scheduler_output=None marks a DP dummy iteration.
         if scheduler_output is None:
             iteration_details = IterationDetails(0, 0, 0, 0)
+            num_waiting_reqs_after_schedule = 0
             is_dummy = True
         else:
             iteration_details = compute_iteration_details(scheduler_output)
+            num_waiting_reqs_after_schedule = (
+                scheduler_output.num_waiting_reqs_after_schedule
+            )
             is_dummy = False
         before = time.monotonic()
         captured: dict[str, Any] = {}
@@ -468,6 +472,8 @@ class EngineCore:
                     " generation tokens, iteration elapsed time: ",
                     format(elapsed_ms, ".4f"),
                     " ms",
+                    ", queued requests: ",
+                    str(num_waiting_reqs_after_schedule),
                     " (dummy)" if is_dummy else "",
                     gpu_timing_str,
                 ]
