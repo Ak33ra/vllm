@@ -148,6 +148,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
 
+        # Per-iteration GPU latency measurement (gpu_forward / gpu_sample). When
+        # enabled, the forward pass and sampler are bracketed with
+        # torch.cuda.Event(enable_timing=True) records on the main stream, and
+        # the elapsed time is resolved inside AsyncOutput.get_output() after the
+        # async copy event has fired (the copy stream waited on the main stream
+        # past these events), so no new GPU sync is introduced. Only active when
+        # observability_config.enable_logging_iteration_details is on.
+        self._gpu_timing_enabled: bool = bool(
+            self.observability_config.enable_logging_iteration_details
+        )
+
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
@@ -1237,6 +1248,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
+        # Record GPU timing event at the start of the forward pass. Skipped for
+        # dummy/profile/capture runs (no per-iteration logging, and recording
+        # events during cudagraph capture is unsafe).
+        timing_forward_start: torch.cuda.Event | None = None
+        if self._gpu_timing_enabled and not dummy_run:
+            timing_forward_start = torch.cuda.Event(enable_timing=True)
+            timing_forward_start.record()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1290,6 +1309,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        # Record GPU timing event at the end of the forward pass (hidden states
+        # ready). compute_logits runs as part of sampling in sample_tokens, so
+        # it is accounted under gpu_sample rather than gpu_forward.
+        timing_forward_end: torch.cuda.Event | None = None
+        if timing_forward_start is not None:
+            timing_forward_end = torch.cuda.Event(enable_timing=True)
+            timing_forward_end.record()
+
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
@@ -1298,6 +1325,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            timing_forward_start=timing_forward_start,
+            timing_forward_end=timing_forward_end,
         )
 
         if not self.is_last_pp_rank:
@@ -1320,6 +1349,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        timing_forward_start = self.execute_model_state.timing_forward_start
+        timing_forward_end = self.execute_model_state.timing_forward_end
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1344,6 +1375,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        # Record GPU timing event at the end of sampling (compute_logits +
+        # sampler). Resolution happens inside AsyncOutput.get_output() after the
+        # copy event syncs, so no new GPU sync is introduced here.
+        timing_sample_end: torch.cuda.Event | None = None
+        if timing_forward_start is not None and timing_forward_end is not None:
+            timing_sample_end = torch.cuda.Event(enable_timing=True)
+            timing_sample_end.record()
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1380,6 +1419,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
+            timing_forward_start=timing_forward_start,
+            timing_forward_end=timing_forward_end,
+            timing_sample_end=timing_sample_end,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -1556,3 +1598,8 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    # GPU timing events recorded on the main stream around the forward pass.
+    # None when enable_logging_iteration_details is off. The matching sample_end
+    # event is created and recorded in sample_tokens().
+    timing_forward_start: torch.cuda.Event | None = None
+    timing_forward_end: torch.cuda.Event | None = None

@@ -5,7 +5,12 @@ import contextlib
 import numpy as np
 import torch
 
-from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    GpuIterationTiming,
+    LogprobsTensors,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
@@ -17,6 +22,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
+        timing_forward_start: torch.cuda.Event | None = None,
+        timing_forward_end: torch.cuda.Event | None = None,
+        timing_sample_end: torch.cuda.Event | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -25,6 +33,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.copy_event = torch.cuda.Event()
+
+        # GPU timing events recorded on the main stream around the forward pass
+        # and sampler. Resolved in get_output() after copy_event has fired:
+        # the copy stream waited on the main stream past all three events
+        # below, so elapsed_time() is non-blocking.
+        self._timing_forward_start = timing_forward_start
+        self._timing_forward_end = timing_forward_end
+        self._timing_sample_end = timing_sample_end
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -66,6 +82,24 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+
+        # Resolve GPU timing. copy_event.synchronize() above guarantees the
+        # main stream has advanced past all three events (the copy stream
+        # waited on it after they were recorded), so elapsed_time() does not
+        # block.
+        if (
+            self._timing_forward_start is not None
+            and self._timing_forward_end is not None
+            and self._timing_sample_end is not None
+        ):
+            self.model_runner_output.gpu_timing = GpuIterationTiming(
+                forward_ms=self._timing_forward_start.elapsed_time(
+                    self._timing_forward_end
+                ),
+                sample_ms=self._timing_forward_end.elapsed_time(
+                    self._timing_sample_end
+                ),
+            )
         return self.model_runner_output
 
 
