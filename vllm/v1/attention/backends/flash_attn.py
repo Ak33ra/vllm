@@ -59,6 +59,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
+    split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -255,6 +256,12 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # For VLLM_FA2_SPLIT_PREFILL_DECODE: boundary between decode (first) and
+    # prefill requests in a reordered batch, so forward() can split a mixed
+    # batch into a packed decode call + a prefill call. 0 disables the split.
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -385,6 +392,22 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
 
+        # Opt-in (VLLM_FA2_SPLIT_PREFILL_DECODE): on FA2, split a mixed batch
+        # into a packed decode call + a prefill call in forward() so the GQA
+        # query-packing fast path (max_seqlen_q==1) fires for decode tokens.
+        # This needs decodes ordered first, so request a reorder with
+        # threshold=1. Restricted to FA2 (FA3/FA4 already pack GQA), no DCP,
+        # and eager/piecewise cudagraphs (the data-dependent split is not
+        # full-cudagraph capturable).
+        self.split_prefill_decode = (
+            envs.VLLM_FA2_SPLIT_PREFILL_DECODE
+            and get_flash_attn_version() == 2
+            and self.dcp_world_size == 1
+            and not self.use_full_cuda_graph
+        )
+        if self.split_prefill_decode:
+            self._init_reorder_batch_threshold(1)
+
     def build(
         self,
         common_prefix_len: int,
@@ -404,6 +427,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+
+        # Find the decode/prefill boundary for VLLM_FA2_SPLIT_PREFILL_DECODE.
+        # Operates on CPU tensors (no GPU sync); decodes are first because the
+        # builder set reorder_batch_threshold=1.
+        num_decodes = 0
+        num_decode_tokens = 0
+        if self.split_prefill_decode:
+            num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=1
+            )
 
         # Disable AOT schedule for spec-decode proposer (not worth the overhead)
         # and for batch invariance (schedule varies with max_seqlen_q/k).
@@ -571,6 +604,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
         return attn_metadata
 
@@ -793,6 +828,54 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+                nd = attn_metadata.num_decodes
+                ndt = attn_metadata.num_decode_tokens
+                if nd > 0 and nd < descale_shape[0]:
+                    # VLLM_FA2_SPLIT_PREFILL_DECODE: mixed batch. Run the decode
+                    # tokens in a separate call with max_seqlen_q=1 so the FA2
+                    # GQA query-packing fast path fires for them, then the
+                    # prefill tokens. Decodes are first (reorder_batch_threshold
+                    # =1). scheduler_metadata is FA3-only (None on FA2).
+                    shared = dict(
+                        k=key_cache,
+                        v=value_cache,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        softcap=self.logits_soft_cap,
+                        fa_version=self.vllm_flash_attn_version,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
+                    # Decode portion: tokens [0:ndt], requests [0:nd].
+                    flash_attn_varlen_func(
+                        q=query[:ndt],
+                        out=output[:ndt],
+                        cu_seqlens_q=cu_seqlens_q[: nd + 1],
+                        max_seqlen_q=1,
+                        seqused_k=seqused_k[:nd],
+                        block_table=block_table[:nd],
+                        q_descale=None if q_descale is None else q_descale[:nd],
+                        k_descale=k_descale[:nd],
+                        v_descale=v_descale[:nd],
+                        **shared,
+                    )
+                    # Prefill portion: tokens [ndt:], requests [nd:].
+                    flash_attn_varlen_func(
+                        q=query[ndt:num_actual_tokens],
+                        out=output[ndt:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q[nd:] - ndt,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k[nd:],
+                        block_table=block_table[nd:],
+                        q_descale=None if q_descale is None else q_descale[nd:],
+                        k_descale=k_descale[nd:],
+                        v_descale=v_descale[nd:],
+                        **shared,
+                    )
+                    return output
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
